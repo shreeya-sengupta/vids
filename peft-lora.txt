@@ -1,0 +1,187 @@
+#imports
+# imports
+import torch
+from transformers import LlamaTokenizer, LlamaForCausalLM, AutoTokenizer, AutoModelForCausalLM
+from transformers import TrainingArguments
+from transformers import Trainer
+import accelerate
+# import bitsandbytes
+from peft import LoraConfig, TaskType
+
+import os
+import sys
+import pandas as pd
+from datasets import load_dataset
+from peft import get_peft_model
+
+
+# model & other variables
+
+
+untuned_model = "EleutherAI/pythia-70m"
+# untuned_model = "TinyLlama/TinyLlama-1.1B-Chat-v0.1"
+# untuned_model = "EleutherAI/pythia-6.9b"
+# untuned_model = "facebook/opt-350m"
+# tuned_model = "tuned_opt-350"
+# untuned_model = "bigscience/mt0-large"
+# tuned_model = "tuned-bigscience/mt0-large"
+# untuned_model = 'openlm-research/open_llama_3b'
+tuned_model = "tuned_llama_3b"
+max_input_tokens = 50
+
+
+# check based on OS
+
+def check_device():
+    platform = sys.platform
+    
+    if platform == "darwin":
+        if not torch.backends.mps.is_available():
+            if not torch.backends.mps.is_built():
+                print("MPS not available because the current PyTorch install was not "
+                      "built with MPS enabled.")
+            else:
+                print("MPS not available because the current MacOS version is not 12.3+ "
+                      "and/or you do not have an MPS-enabled device on this machine.")
+        else:
+            device = torch.device("mps")
+    elif platform == "win32":
+        device_count = torch.cuda.device_count()
+        if device_count > 0:
+            print("Select GPU device")
+            device = torch.device("cuda")
+        else:
+            print("Select CPU device")
+            device = torch.device("cpu")
+    else:
+        print("platform not recognised")
+        
+    print(device)
+    return device
+
+#test the function
+print(check_device())
+
+
+def load_model(model_to_load):
+    tokenizer = AutoTokenizer.from_pretrained(model_to_load)
+    model = AutoModelForCausalLM.from_pretrained(model_to_load, torch_dtype=torch.float16, device_map=device)
+    return tokenizer, model
+
+# test
+# tokenizer1, model1 = load_model(untuned_model)
+# print(tokenizer1)
+# print(model1)
+
+
+def tokenize_function(df_to_tokenise):
+  tokenizer_base.pad_token=tokenizer_base.eos_token
+  tokenized_inputs = tokenizer_base(df_to_tokenise["text"], return_tensors="pt", padding='max_length', truncation=True, max_length=max_length).input_ids.to(device)
+  return {"input_ids": tokenized_inputs}
+
+
+  def run_inferencing(input_ids, model, device):
+  # input_ids = tokenizer(text, return_tensors="pt").input_ids.to(device)
+  model_output = model.generate(input_ids)
+  response = tokenizer.decode(model_output[0], skip_special_tokens=True)
+  return response
+
+
+
+# Prepare dataset
+
+def read_dataset(filename):
+    if str(filename).endswith("csv"):
+        train_ds, test_ds = load_dataset('csv', data_files=[filename], split=['train[:80%]','train[:20%]'])
+    elif str(filename).endswith("parquet"):
+        train_ds, test_ds = load_dataset("parquet", data_files=filename, split=['train[:80%]','train[:20%]'])
+    elif str(filename).endswith("jsonl") or str(filename).endswith("json"):
+        train_ds, test_ds = load_dataset("json", data_files=filename, split=['train[:80%]','train[:20%]'])
+    else:
+        print("file format not supported")
+    return train_ds, test_ds
+
+
+#test
+# file = "train-00000-of-00001-a09b74b3ef9c3b56.parquet"
+# file = "input_ds.csv"
+# train_data, test_data = read_dataset(file)
+''# print(train_data)
+# print(test_data)
+
+def tokenise_read_dataset(train_ds, test_ds):
+    tokenised_train = train_ds.map(tokenize_function, batched=True)
+    print(tokenised_train)
+    train_lora = tokenised_train.add_column("labels", tokenised_train["input_ids"])
+    print(train_lora)
+    tokenised_test = test_ds.map(tokenize_function, batched=True)
+    print(tokenised_test)
+    test_lora = tokenised_test.add_column("labels", tokenised_test["input_ids"])
+    print(test_lora)
+    return train_lora, test_lora
+
+
+def prepare_dataset(data_file):
+    train_data, test_data = read_dataset(data_file)
+    train_final, test_final = tokenise_read_dataset(train_data, test_data)
+    return train_final, test_final
+
+# peft lora and other configurations
+
+peft_config = LoraConfig(task_type=TaskType.CAUSAL_LM,
+                         inference_mode=False, r=8,
+                         lora_alpha=32,
+                         lora_dropout=0.1)
+
+# train with trainer class
+# setup some training parameters
+
+training_args = TrainingArguments(
+    output_dir="llama3b/mt0-large-lora",
+    learning_rate=1e-3,
+    per_device_train_batch_size=3,
+    per_device_eval_batch_size=3,
+    num_train_epochs=2,
+    weight_decay=0.1,
+    eval_strategy="epoch",
+    save_strategy="epoch",
+    load_best_model_at_end=True,
+    disable_tqdm=False,
+    # use_mps_device=True,
+    use_cpu=True
+)
+
+
+def get_training_object(model_base, training_args, train_ds, eval_ds):
+    trainer = Trainer(
+        model=model_base,
+        args=training_args,
+        train_dataset=train_ds,
+        eval_dataset=eval_ds
+    )
+    return trainer
+
+def start_training(model_base, train_ds, eval_ds):
+    tuned_model = get_peft_model(model_base, peft_config)
+    tuned_model.print_trainable_parameters()
+    trainer = get_training_object(model_base, training_args, train_ds, eval_ds)
+    #train the model
+    trainer.train()
+    return trainer
+
+#main function
+
+#load data, model, tokenizer
+datafile = "train-00000-of-00001-a09b74b3ef9c3b56.parquet"
+device = check_device()
+max_length = 714
+tokenizer_base, model_base = load_model(untuned_model)
+
+# prepare test train set
+train_data, test_data = prepare_dataset(datafile)
+print(f"train data: {type(train_data)}")
+print(f"test data: {test_data}")
+
+# train model 
+trainer = start_training(model_base, train_data, test_data)
+
